@@ -152,7 +152,7 @@ async def display(
 
     response = {
         "status": 0,
-        "image_url": f"http://192.168.0.222:2300/static/{device['image']}",
+        "image_url": f"/static/{device['image']}",
         "filename": filename,
         "update_firmware": update_firmware,
         "firmware_url": SETTINGS["firmware_download_url"] if update_firmware else None,
