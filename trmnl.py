@@ -21,6 +21,7 @@ os.makedirs(DATA_FOLDER, exist_ok=True)
 # In-memory storage for devices and logs
 devices = {}
 logs = []
+address = ""
 
 # Global server settings
 SETTINGS = {
@@ -152,7 +153,7 @@ async def display(
 
     response = {
         "status": 0,
-        "image_url": f"/static/{device['image']}",
+        "image_url": f"{address}/static/{device['image']}",
         "filename": filename,
         "update_firmware": update_firmware,
         "firmware_url": SETTINGS["firmware_download_url"] if update_firmware else None,
@@ -190,6 +191,7 @@ if __name__ == "__main__":
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to bind")
     parser.add_argument("--port", type=int, default=2300, help="Port to bind")
     parser.add_argument("--loglevel", type=str, default="debug", help="Logging level (debug, info, warning, error, critical)")
+    parser.add_argument("--address", type=str, default="http://192.168.0.100:2300", help="Remote serving address for clients")
     args = parser.parse_args()
 
     # Configure logging with argparse loglevel
@@ -203,5 +205,6 @@ if __name__ == "__main__":
     load_devices()
 
     logger.info(f"Starting server on {args.host}:{args.port} with loglevel={args.loglevel}")
+    address = args.address
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.loglevel)
 
