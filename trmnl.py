@@ -136,7 +136,7 @@ async def display(
     # Schedule update script execution (refresh_rate - 20s)
     try:
         refresh_delay = int(device.get("refresh_rate", SETTINGS["default_refresh_rate"]))
-        refresh_delay -= int(device.get("pre_rate", SETTINGS["pre_rate"]))
+        refresh_delay -= int(device.get("pre_refresh", SETTINGS["pre_refresh"]))
         if refresh_delay > 0:
             asyncio.create_task(run_update_script_later(device, refresh_delay))
     except Exception as e:
