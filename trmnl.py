@@ -105,7 +105,7 @@ async def run_update_script_later(device, delay):
     if os.path.exists(script_path):
         try:
             logger.info(f"Running update script for {device['friendly_id']} after {delay}s")
-            subprocess.run(["python3", script_path], check=True)
+            subprocess.run([script_path, f"images/{device['friendly_id']}.bmp"], check=True)
             new_image = f"{device['friendly_id']}.bmp"
             device["image"] = new_image
             save_devices()
