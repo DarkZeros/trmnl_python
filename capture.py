@@ -3,6 +3,7 @@ import asyncio
 from playwright.async_api import async_playwright
 from PIL import Image
 import os
+import shutil
 
 async def screenshot(url: str, output: str, full_page: bool, width: int, height: int, ignore_cert_errors: bool, wait: int):
     async with async_playwright() as p:
@@ -104,7 +105,8 @@ def main():
     if args.crop:
         regions = parse_crop_regions(args.crop)
         root, ext = os.path.splitext(args.output)
-        cropped_output = root + "_cropped" + ext
+        shutil.copyfile(args.output, f"{root}_ori.{ext}")
+        cropped_output = root + ext
         crop_and_pack(
             args.output, cropped_output, regions,
             canvas_size=(args.canvas_width, args.canvas_height)
