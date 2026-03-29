@@ -73,31 +73,6 @@ def parse_capture_spec(spec: str) -> CaptureSpec:
     )
 
 
-def pick_grid(n: int, canvas_w: int, canvas_h: int, gap: int) -> Tuple[int, int, int, int]:
-    """
-    Choose cols, rows to maximize tile area. Return (cols, rows, cell_w, cell_h).
-    """
-    best = None
-    for cols in range(1, n + 1):
-        rows = ceil(n / cols)
-        # Total gaps
-        total_gap_w = gap * (cols + 1)
-        total_gap_h = gap * (rows + 1)
-        cell_w = (canvas_w - total_gap_w) // cols
-        cell_h = (canvas_h - total_gap_h) // rows
-        if cell_w <= 0 or cell_h <= 0:
-            continue
-        area = cell_w * cell_h
-        score = area  # could weight aspect ratio if desired
-        if best is None or score > best[0]:
-            best = (score, cols, rows, cell_w, cell_h)
-
-    if best is None:
-        raise ValueError("Canvas too small for any tiles with current gap")
-    _, cols, rows, cell_w, cell_h = best
-    return cols, rows, cell_w, cell_h
-
-
 def fit_inside(src_w: int, src_h: int, dst_w: int, dst_h: int) -> Tuple[int, int]:
     if src_w == 0 or src_h == 0:
         return 0, 0
@@ -152,7 +127,7 @@ def make_tile(
     draw = ImageDraw.Draw(tile)
 
     # Header height heuristic
-    header_h = max(16, min(40, cell_h // 10))
+    header_h = 16
     # Font selection: default bitmap font; if too tall, it will still fit
     font = ImageFont.load_default()
 
@@ -216,23 +191,43 @@ async def capture_fullpage_png(
     return img
 
 
+@dataclass
+class TileCrop:
+    img: Image.Image
+    label: str
+    orig_w: int
+    orig_h: int
+
+
+def pack_rows(tiles: List[TileCrop], canvas_w: int, gap: int) -> List[List[TileCrop]]:
+    """Pack tiles sequentially into rows based on natural width."""
+    rows: List[List[TileCrop]] = []
+    current: List[TileCrop] = []
+    used_w = 0
+    for t in tiles:
+        w = t.orig_w + (gap if current else 0)
+        if current and used_w + w > canvas_w:
+            rows.append(current)
+            current = [t]
+            used_w = t.orig_w
+        else:
+            current.append(t)
+            used_w += w
+    if current:
+        rows.append(current)
+    return rows
+
+
 async def run(args):
-    # Parse captures
     captures: List[CaptureSpec] = [parse_capture_spec(s) for s in args.capture]
-
-    if len(captures) == 0:
+    if not captures:
         raise SystemExit("At least one --capture is required")
-
     canvas_w, canvas_h = parse_size(args.size)
 
-    # Group captures by URL (to avoid reloading the same site)
+    # group + screenshot
     by_url: Dict[str, List[CaptureSpec]] = {}
     for c in captures:
         by_url.setdefault(c.url, []).append(c)
-
-    # Decide viewport per URL: choose the largest requested (or default)
-    def default_vp():
-        return (1280, 1600)
 
     viewports_by_url: Dict[str, Tuple[int, int]] = {}
     waits_by_url: Dict[str, List[int]] = {}
@@ -243,70 +238,66 @@ async def run(args):
             max_h = max(v[1] for v in vp_list)
             viewports_by_url[url] = (max_w, max_h)
         else:
-            viewports_by_url[url] = default_vp()
+            viewports_by_url[url] = (1280, 1600)
         waits_by_url[url] = [c.wait_ms for c in lst]
 
-    # Take screenshots per unique URL
     screenshots: Dict[str, Image.Image] = {}
     async with async_playwright() as p:
-        for url in by_url.keys():
+        for url in by_url:
             screenshots[url] = await capture_fullpage_png(
                 p, args.browser, url, viewports_by_url[url], waits_by_url[url]
             )
 
-    # Prepare layout
-    n_tiles = len(captures)
-    cols, rows, cell_w, cell_h = pick_grid(n_tiles, canvas_w, canvas_h, args.gap)
-
-    # Build each tile
-    tiles: List[Image.Image] = []
+    # Collect crops
+    crops: List[TileCrop] = []
     for c in captures:
         full = screenshots[c.url]
-        # Clip region to page bounds
-        x = max(0, c.x)
-        y = max(0, c.y)
+        x, y = max(0, c.x), max(0, c.y)
         w = max(0, min(c.w, full.width - x))
         h = max(0, min(c.h, full.height - y))
         if w <= 0 or h <= 0:
-            # Create an empty tile with an error header
-            region = Image.new("RGB", (1, 1), color=(255, 255, 255))
-            label = (c.name or f"{hostname(c.url)}") + " [invalid region]"
+            region = Image.new("RGB", (1, 1), "white")
+            label = (c.name or hostname(c.url)) + " [invalid region]"
         else:
             region = full.crop((x, y, x + w, y + h))
-            label = c.name or f"{hostname(c.url)}  {c.x},{c.y},{c.w},{c.h}"
+            label = c.name or f"{hostname(c.url)} {c.x},{c.y},{c.w},{c.h}"
+        crops.append(TileCrop(region, label, region.width, region.height))
 
-        tile = make_tile(
-            region_img=region,
-            label=label,
-            cell_w=cell_w,
-            cell_h=cell_h,
-            padding=args.tile_padding,
-            draw_borders=(not args.no_borders),
-        )
-        tiles.append(tile)
+    # Row packing (unscaled)
+    rows = pack_rows(crops, canvas_w, args.gap)
+    row_widths = [sum(t.orig_w for t in row) + args.gap * (len(row) + 1) for row in rows]
+    row_heights = [max(t.orig_h for t in row) + args.tile_padding * 2 + 20 for row in rows]
+    natural_w = max(row_widths)
+    natural_h = sum(row_heights) + args.gap * (len(rows) + 1)
 
-    # Compose onto final canvas (grayscale first for best 1-bit conversion)
-    canvas = Image.new("L", (canvas_w, canvas_h), color=255)
-    # place tiles with gaps
-    idx = 0
-    for r in range(rows):
-        for c in range(cols):
-            if idx >= n_tiles:
-                break
-            x = args.gap + c * (cell_w + args.gap)
-            y = args.gap + r * (cell_h + args.gap)
-            canvas.paste(tiles[idx], (x, y))
-            idx += 1
+    # Global scale factor
+    scale = min(canvas_w / natural_w, canvas_h / natural_h, 1.0)
 
-    # Convert to 1-bit and save as BMP (BMP v3 1bpp)
-    out_1b = canvas.convert("1")
-    # Pillow writes BMP v3 by default for 1-bit images
+    # Compose final canvas
+    canvas = Image.new("L", (canvas_w, canvas_h), 255)
+    y = args.gap
+    for r_i, row in enumerate(rows):
+        x = args.gap
+        row_h = max(int(t.orig_h * scale) for t in row) + args.tile_padding * 2 + 20
+        for t in row:
+            tw = int(t.orig_w * scale)
+            th = int(t.orig_h * scale)
+            # Render tile now at final size
+            tile_img = make_tile(
+                t.img.resize((tw, th), Image.LANCZOS),
+                t.label,
+                tw + args.tile_padding * 2,
+                th + args.tile_padding * 2 + 20,
+                padding=args.tile_padding,
+                draw_borders=(not args.no_borders),
+            )
+            canvas.paste(tile_img, (x, y))
+            x += tile_img.width + args.gap
+        y += row_h + args.gap
+
+    out_1b = canvas.convert("1", dither=Image.NONE)
     out_1b.save(args.output, format="BMP")
-
-    print(
-        f"Saved {n_tiles} tile(s) to {args.output} "
-        f"as {canvas_w}x{canvas_h} BMP (1-bit)."
-    )
+    print(f"Saved {len(crops)} tile(s) to {args.output} with row-packer scaling.")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -335,13 +326,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--gap",
         type=int,
-        default=4,
+        default=2,
         help="Gap/padding between tiles on the final canvas (default: 4)",
     )
     p.add_argument(
         "--tile-padding",
         type=int,
-        default=6,
+        default=2,
         help="Inner padding around each region inside its tile (default: 6)",
     )
     p.add_argument(
