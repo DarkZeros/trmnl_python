@@ -295,7 +295,7 @@ async def run(args):
             x += tile_img.width + args.gap
         y += row_h + args.gap
 
-    out_1b = canvas.convert("1", dither=Image.NONE)
+    out_1b = canvas.convert("1")
     out_1b.save(args.output, format="BMP")
     print(f"Saved {len(crops)} tile(s) to {args.output} with row-packer scaling.")
 
