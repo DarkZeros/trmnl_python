@@ -99,14 +99,26 @@ async def setup(ID: str = Header(None)):
 
 import asyncio
 
+# At most one pending update per device; otherwise every /api/display call (retries included)
+# queues another capture.
+pending_updates = {}
+
 async def run_update_script_later(device, delay):
     await asyncio.sleep(delay)
     script_path = os.path.join("scripts", f"{device['friendly_id']}.sh")
     if os.path.exists(script_path):
         try:
             logger.info(f"Running update script for {device['friendly_id']} after {delay}s")
-            subprocess.run([script_path, f"images/{device['friendly_id']}.bmp"], check=True)
-            new_image = f"{device['friendly_id']}.bmp"
+            # "image_format": "png" makes the script render a 4-gray PNG instead of a 1-bit BMP
+            new_image = f"{device['friendly_id']}.{device.get('image_format', 'bmp')}"
+            # In a worker thread: a browser capture takes seconds and would otherwise block the
+            # event loop, so the device's own API calls time out while it runs.
+            # Render into a temp file and swap it in when complete: capture scripts write
+            # intermediate images (raw screenshot, crop) to their output path, and a device waking
+            # mid-capture would otherwise download and show one of those.
+            tmp_path = os.path.join(IMAGE_FOLDER, f".tmp_{new_image}")
+            await asyncio.to_thread(subprocess.run, [script_path, tmp_path], check=True)
+            os.replace(tmp_path, os.path.join(IMAGE_FOLDER, new_image))
             device["image"] = new_image
             save_devices()
             logger.info(f"Updated image for {device['friendly_id']} to {new_image}")
@@ -121,8 +133,15 @@ async def display(
     Battery_Voltage: str = Header(None, alias="Battery-Voltage"),
     FW_Version: str = Header(None, alias="FW-Version"),
     RSSI: str = Header(None),
+    Wake_Time: str = Header(None, alias="Wake-Time"),
+    Timings: str = Header(None),
 ):
     logger.debug(f"/api/display called with headers: ID={ID}, Access_Token={Access_Token}, Refresh_Rate={Refresh_Rate}, Battery_Voltage={Battery_Voltage}, FW_Version={FW_Version}, RSSI={RSSI}")
+    if Timings:
+        # Previous wake cycle, per phase in ms (sent by the instrumented firmware)
+        logger.info(f"Timings from {ID}: {Timings} (battery={Battery_Voltage}V, rssi={RSSI})")
+    elif Wake_Time:
+        logger.info(f"Wake time from {ID}: {Wake_Time} ms (battery={Battery_Voltage}V, rssi={RSSI})")
 
     if not ID or not Access_Token:
         logger.warning("/api/display missing required headers")
@@ -138,18 +157,23 @@ async def display(
     try:
         refresh_delay = int(device.get("refresh_rate", SETTINGS["default_refresh_rate"]))
         refresh_delay -= int(device.get("pre_refresh", SETTINGS["pre_refresh"]))
-        if refresh_delay > 0:
-            asyncio.create_task(run_update_script_later(device, refresh_delay))
+        task = pending_updates.get(ID)
+        if refresh_delay > 0 and (task is None or task.done()):
+            pending_updates[ID] = asyncio.create_task(run_update_script_later(device, refresh_delay))
     except Exception as e:
         logger.error(f"Failed to schedule script execution for {device['friendly_id']}: {e}")
 
     # Determine firmware update requirement
     update_firmware = SETTINGS["firmware_upgrading"] and FW_Version != SETTINGS["firmware_version"]
 
+    # The device skips the download and the e-paper refresh when the filename matches what it is
+    # already showing, so name the image by its content: re-rendering an identical dashboard
+    # then costs the device nothing.
     file_path = os.path.join(IMAGE_FOLDER, device["image"])
+    filename = "empty"
     if os.path.exists(file_path):
-        file_timestamp = os.path.getmtime(file_path)
-        filename = str(int(file_timestamp))  # or use datetime if you prefer ISO format
+        with open(file_path, "rb") as f:
+            filename = hashlib.sha1(f.read()).hexdigest()[:16]
 
     response = {
         "status": 0,
