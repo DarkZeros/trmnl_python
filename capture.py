@@ -4,6 +4,8 @@ from playwright.async_api import async_playwright
 from PIL import Image
 import os
 import shutil
+import struct
+import zlib
 
 async def screenshot(url: str, output: str, full_page: bool, width: int, height: int, ignore_cert_errors: bool, wait: int):
     async with async_playwright() as p:
@@ -28,6 +30,40 @@ def convert_to_bmp3_1bit(input_file: str, output_file: str):
     img = Image.open(input_file)
     bw = img.convert("1")  # enforce 1-bit, black & white
     bw.save(output_file, format="BMP")  # Pillow defaults to BMP v3
+
+def convert_to_png_2bit_gray(input_file: str, output_file: str):
+    """Convert image to a 4-level (2-bit) grayscale PNG, Floyd-Steinberg dithered.
+
+    This is the format the TRMNL firmware shows in its 4-gray mode. Pillow can't write 2-bit
+    grayscale PNGs, so the file is assembled by hand (color type 0, bit depth 2).
+    """
+    levels = [0, 85, 170, 255]  # black, dark gray, light gray, white
+    pal = Image.new("P", (1, 1))
+    pal.putpalette([c for v in levels for c in (v, v, v)] + [0] * 3 * (256 - len(levels)))
+    img = Image.open(input_file).convert("L").convert("RGB")
+    indexed = img.quantize(palette=pal, dither=Image.Dither.FLOYDSTEINBERG)  # index == gray level 0..3
+
+    w, h = indexed.size
+    px = indexed.tobytes()
+    raw = bytearray()
+    for y in range(h):
+        raw.append(0)  # filter: none
+        row = px[y * w:(y + 1) * w]
+        for x in range(0, w, 4):
+            b = 0
+            for i in range(4):
+                b = (b << 2) | (row[x + i] & 3 if x + i < w else 0)
+            raw.append(b)
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data))
+
+    png = b"\x89PNG\r\n\x1a\n"
+    png += chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 2, 0, 0, 0, 0))
+    png += chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+    png += chunk(b"IEND", b"")
+    with open(output_file, "wb") as f:
+        f.write(png)
 
 def crop_and_pack(input_file: str, output_file: str, regions: list, canvas_size=(800, 480), bg_color="white"):
     """
@@ -87,6 +123,7 @@ def main():
     parser.add_argument("--width", type=int, default=800, help="Viewport width (default: 800)")
     parser.add_argument("--height", type=int, default=480, help="Viewport height (default: 480)")
     parser.add_argument("--bmp3", action="store_true", help="Convert output to BMP v3 (1-bit black & white)")
+    parser.add_argument("--gray4", action="store_true", help="Convert output to a 4-level (2-bit) grayscale PNG")
     parser.add_argument("--no-ignore-cert-errors", action="store_true", help="Do not ignore SSL/TLS certificate errors")
     parser.add_argument("--wait", type=int, default=0, help="Wait time in seconds before taking screenshot (default: 0)")
     parser.add_argument("--crop", nargs="+", help="Crop regions in x,y,w,h format (multiple allowed)")
@@ -120,6 +157,13 @@ def main():
         bmp_output = root + ".bmp"
         convert_to_bmp3_1bit(args.output, bmp_output)
         print(f"Converted to BMP v3 (1-bit): {bmp_output}")
+
+    # Convert to 4-level grayscale PNG if requested (written next to the output as <root>.png)
+    if args.gray4:
+        root, _ = os.path.splitext(args.output)
+        png_output = root + ".png"
+        convert_to_png_2bit_gray(args.output, png_output)
+        print(f"Converted to PNG (2-bit grayscale): {png_output}")
 
 if __name__ == "__main__":
     main()
