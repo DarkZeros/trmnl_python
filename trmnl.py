@@ -103,6 +103,10 @@ import asyncio
 # queues another capture.
 pending_updates = {}
 
+# One capture at a time: concurrent headless Chromiums starve each other on the server and
+# page.screenshot() times out. (Captures used to be serialized by blocking the event loop.)
+capture_lock = asyncio.Lock()
+
 async def run_update_script_later(device, delay):
     await asyncio.sleep(delay)
     script_path = os.path.join("scripts", f"{device['friendly_id']}.sh")
@@ -117,7 +121,8 @@ async def run_update_script_later(device, delay):
             # intermediate images (raw screenshot, crop) to their output path, and a device waking
             # mid-capture would otherwise download and show one of those.
             tmp_path = os.path.join(IMAGE_FOLDER, f".tmp_{new_image}")
-            await asyncio.to_thread(subprocess.run, [script_path, tmp_path], check=True)
+            async with capture_lock:
+                await asyncio.to_thread(subprocess.run, [script_path, tmp_path], check=True, timeout=180)
             os.replace(tmp_path, os.path.join(IMAGE_FOLDER, new_image))
             device["image"] = new_image
             save_devices()

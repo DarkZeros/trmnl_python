@@ -1,6 +1,6 @@
 import argparse
 import asyncio
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 from PIL import Image
 import os
 import shutil
@@ -9,21 +9,34 @@ import zlib
 
 async def screenshot(url: str, output: str, full_page: bool, width: int, height: int, ignore_cert_errors: bool, wait: int):
     async with async_playwright() as p:
-        browser = await p.chromium.launch()
-        context = await browser.new_context(
-            viewport={"width": width, "height": height},
-            ignore_https_errors=ignore_cert_errors
-        )
-        page = await context.new_page()
-        await page.goto(url)
+        # Containers give /dev/shm only 64MB by default; Chromium then stalls on large viewports
+        # and page.screenshot() times out right after "fonts loaded". No GPU on the server either.
+        browser = await p.chromium.launch(args=["--disable-dev-shm-usage", "--disable-gpu"])
+        try:
+            context = await browser.new_context(
+                viewport={"width": width, "height": height},
+                ignore_https_errors=ignore_cert_errors
+            )
+            page = await context.new_page()
+            await page.goto(url)
 
-        # Wait if requested
-        if wait > 0:
-            await page.wait_for_timeout(wait * 1000)
+            # Wait if requested
+            if wait > 0:
+                await page.wait_for_timeout(wait * 1000)
 
-        # Always screenshot first (in original format)
-        await page.screenshot(path=output, type='png', full_page=full_page)
-        await browser.close()
+            # Always screenshot first (in original format). A busy dashboard (live charts,
+            # spinners) can keep the renderer from producing a frame, so freeze animations
+            # and retry once after a reload if it still times out.
+            try:
+                await page.screenshot(path=output, type='png', full_page=full_page, animations="disabled", timeout=60000)
+            except PlaywrightTimeoutError:
+                print("⚠️ Screenshot timed out, reloading and retrying once")
+                await page.reload()
+                if wait > 0:
+                    await page.wait_for_timeout(wait * 1000)
+                await page.screenshot(path=output, type='png', full_page=full_page, animations="disabled", timeout=60000)
+        finally:
+            await browser.close()
 
 def convert_to_bmp3_1bit(input_file: str, output_file: str):
     """Convert image to BMP v3, 1-bit monochrome."""
