@@ -5,6 +5,7 @@ import logging
 import argparse
 import json
 import subprocess
+from datetime import datetime, timedelta
 from fastapi import FastAPI, Request, Header
 from fastapi.responses import JSONResponse, FileResponse
 
@@ -31,6 +32,11 @@ SETTINGS = {
     "default_image": "default.bmp",
     "default_refresh_rate": "1800",
     "pre_refresh": 20,
+    # Slower refresh at night: set "night_refresh_rate" (seconds) plus "night_start"/"night_end"
+    # ("HH:MM", local time; the window may wrap midnight). Overridable per device.
+    "night_refresh_rate": None,
+    "night_start": "23:00",
+    "night_end": "07:00",
 }
 
 # Ensure images folder exists
@@ -59,6 +65,34 @@ def save_devices():
         logger.debug("Devices saved to disk")
     except Exception as e:
         logger.error(f"Failed to save devices: {e}")
+
+
+def device_setting(device, key):
+    return device.get(key, SETTINGS[key])
+
+
+def effective_refresh_rate(device, now=None):
+    """Refresh rate for this wake, in seconds: the night rate inside the night window.
+
+    The night sleep is cut short at the window's end so the device is back on its day rate
+    on time instead of up to one night interval late.
+    """
+    rate = int(device.get("refresh_rate", SETTINGS["default_refresh_rate"]))
+    night_rate = device_setting(device, "night_refresh_rate")
+    if not night_rate:
+        return rate
+    now = now or datetime.now()
+    start = datetime.strptime(device_setting(device, "night_start"), "%H:%M").time()
+    end = datetime.strptime(device_setting(device, "night_end"), "%H:%M").time()
+    t = now.time()
+    in_night = (start <= t < end) if start <= end else (t >= start or t < end)
+    if not in_night:
+        return rate
+    end_dt = datetime.combine(now.date(), end)
+    if end_dt <= now:
+        end_dt += timedelta(days=1)
+    until_end = int((end_dt - now).total_seconds())
+    return max(rate, min(int(night_rate), until_end))
 
 
 # Accept both /api/setup and /api/setup/
@@ -157,11 +191,16 @@ async def display(
         logger.error(f"Device not found or token mismatch for ID={ID}")
         return {"status": 500, "error": "Device not found"}
         
+    try:
+        refresh_rate = effective_refresh_rate(device)
+    except ValueError as e:
+        logger.error(f"Bad refresh/night settings for {device['friendly_id']}: {e}")
+        refresh_rate = int(device.get("refresh_rate", SETTINGS["default_refresh_rate"]))
+
     # Update the image dynamically if a script exists
     # Schedule update script execution (refresh_rate - 20s)
     try:
-        refresh_delay = int(device.get("refresh_rate", SETTINGS["default_refresh_rate"]))
-        refresh_delay -= int(device.get("pre_refresh", SETTINGS["pre_refresh"]))
+        refresh_delay = refresh_rate - int(device_setting(device, "pre_refresh"))
         task = pending_updates.get(ID)
         if refresh_delay > 0 and (task is None or task.done()):
             pending_updates[ID] = asyncio.create_task(run_update_script_later(device, refresh_delay))
@@ -186,7 +225,7 @@ async def display(
         "filename": filename,
         "update_firmware": update_firmware,
         "firmware_url": SETTINGS["firmware_download_url"] if update_firmware else None,
-        "refresh_rate": device.get("refresh_rate", SETTINGS["default_refresh_rate"]),
+        "refresh_rate": str(refresh_rate),
         "reset_firmware": False,
     }
 
