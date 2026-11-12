@@ -5,6 +5,7 @@ import logging
 import argparse
 import json
 import subprocess
+import time
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request, Header
 from fastapi.responses import JSONResponse, FileResponse
@@ -26,9 +27,14 @@ address = ""
 
 # Global server settings
 SETTINGS = {
+    # OTA: when "firmware_upgrading" is on and firmware/<firmware_file> exists, any device that
+    # reports a FW-Version other than "firmware_version" is told to download and install it.
+    # The device then reports the new version and the offer stops by itself, so the version
+    # compiled into the .bin (FW_*_VERSION in the firmware's include/config.h) must match.
     "firmware_upgrading": False,
-    "firmware_version": "1.5.2",
-    "firmware_download_url": "https://trmnl.s3.us-east-2.amazonaws.com/path-to-firmware.bin",
+    "firmware_version": "1.8.17",
+    "firmware_file": "firmware.bin",
+    "firmware_download_url": None,  # None: serve firmware/<firmware_file> from this server
     "default_image": "default.bmp",
     "default_refresh_rate": "1800",
     "pre_refresh": 20,
@@ -39,9 +45,55 @@ SETTINGS = {
     "night_end": "07:00",
 }
 
+# Optional overrides for SETTINGS, e.g. {"firmware_upgrading": true}. Re-read whenever the file
+# changes, and at least once an hour regardless, so OTA can be switched on and off without
+# touching the code or restarting.
+SETTINGS_FILE = os.path.join(DATA_FOLDER, "settings.json")
+SETTINGS_REREAD_SECONDS = 3600
+DEFAULT_SETTINGS = dict(SETTINGS)
+_settings_mtime = None
+_settings_read_at = None
+
+def load_settings_overrides():
+    global _settings_mtime, _settings_read_at
+    try:
+        mtime = os.path.getmtime(SETTINGS_FILE)
+    except OSError:
+        mtime = None
+    now = time.monotonic()
+    fresh = _settings_read_at is not None and now - _settings_read_at < SETTINGS_REREAD_SECONDS
+    if mtime == _settings_mtime and fresh:
+        return
+    _settings_mtime = mtime
+    _settings_read_at = now
+    overrides = {}
+    if mtime is not None:
+        try:
+            with open(SETTINGS_FILE) as f:
+                overrides = json.load(f)
+            if not isinstance(overrides, dict):
+                raise ValueError("expected a JSON object")
+        except (OSError, ValueError) as e:
+            logger.error(f"Ignoring {SETTINGS_FILE}: {e}")
+            overrides = {}
+    unknown = [k for k in overrides if k not in DEFAULT_SETTINGS]
+    if unknown:
+        logger.warning(f"Unknown keys in {SETTINGS_FILE}: {unknown}")
+    SETTINGS.clear()
+    SETTINGS.update(DEFAULT_SETTINGS)
+    SETTINGS.update({k: v for k, v in overrides.items() if k in DEFAULT_SETTINGS})
+    applied = {k: v for k, v in SETTINGS.items() if v != DEFAULT_SETTINGS[k]}
+    if applied != getattr(load_settings_overrides, "last_applied", None):
+        logger.info(f"Settings overrides from {SETTINGS_FILE}: {applied}")
+    load_settings_overrides.last_applied = applied
+
 # Ensure images folder exists
 IMAGE_FOLDER = "images"
 os.makedirs(IMAGE_FOLDER, exist_ok=True)
+
+# OTA firmware images (the PlatformIO build's firmware.bin) go here
+FIRMWARE_FOLDER = "firmware"
+os.makedirs(FIRMWARE_FOLDER, exist_ok=True)
 
 
 def load_devices():
@@ -186,6 +238,8 @@ async def display(
         logger.warning("/api/display missing required headers")
         return JSONResponse(status_code=400, content={"status": 400, "error": "Missing headers"})
 
+    load_settings_overrides()
+
     device = devices.get(ID)
     if not device or device["api_key"] != Access_Token:
         logger.error(f"Device not found or token mismatch for ID={ID}")
@@ -208,7 +262,16 @@ async def display(
         logger.error(f"Failed to schedule script execution for {device['friendly_id']}: {e}")
 
     # Determine firmware update requirement
-    update_firmware = SETTINGS["firmware_upgrading"] and FW_Version != SETTINGS["firmware_version"]
+    update_firmware = bool(SETTINGS["firmware_upgrading"]) and FW_Version != SETTINGS["firmware_version"]
+    firmware_url = SETTINGS["firmware_download_url"]
+    if update_firmware and not firmware_url:
+        if os.path.exists(os.path.join(FIRMWARE_FOLDER, SETTINGS["firmware_file"])):
+            firmware_url = f"{address}/firmware/{SETTINGS['firmware_file']}"
+        else:
+            logger.warning(f"Firmware upgrade is on but {FIRMWARE_FOLDER}/{SETTINGS['firmware_file']} is missing")
+            update_firmware = False
+    if update_firmware:
+        logger.info(f"Offering firmware {SETTINGS['firmware_version']} to {device['friendly_id']} (has {FW_Version}): {firmware_url}")
 
     # The device skips the download and the e-paper refresh when the filename matches what it is
     # already showing, so name the image by its content: re-rendering an identical dashboard
@@ -224,7 +287,7 @@ async def display(
         "image_url": f"{address}/static/{device['image']}",
         "filename": filename,
         "update_firmware": update_firmware,
-        "firmware_url": SETTINGS["firmware_download_url"] if update_firmware else None,
+        "firmware_url": firmware_url if update_firmware else None,
         "refresh_rate": str(refresh_rate),
         "reset_firmware": False,
     }
@@ -251,6 +314,15 @@ async def serve_image(filename: str):
         return JSONResponse(status_code=404, content={"status": 404, "error": "Image not found"})
     logger.info(f"Serving image: {file_path}")
     return FileResponse(file_path)
+
+@app.get("/firmware/{filename}")
+async def serve_firmware(filename: str):
+    file_path = os.path.join(FIRMWARE_FOLDER, filename)
+    if not os.path.exists(file_path):
+        logger.warning(f"Firmware not found: {file_path}")
+        return JSONResponse(status_code=404, content={"status": 404, "error": "Firmware not found"})
+    logger.info(f"Serving firmware: {file_path}")
+    return FileResponse(file_path, media_type="application/octet-stream")
 
 if __name__ == "__main__":
     import uvicorn
