@@ -2,6 +2,7 @@ import os
 import uuid
 import hashlib
 import logging
+from logging.handlers import RotatingFileHandler
 import argparse
 import json
 import subprocess
@@ -332,13 +333,21 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=2300, help="Port to bind")
     parser.add_argument("--loglevel", type=str, default="debug", help="Logging level (debug, info, warning, error, critical)")
     parser.add_argument("--address", type=str, default="http://192.168.0.100:2300", help="Remote serving address for clients")
+    parser.add_argument("--logfile", type=str, default=os.path.join(DATA_FOLDER, "trmnl.log"), help="Log file, written in addition to the terminal")
     args = parser.parse_args()
 
     # Configure logging with argparse loglevel
     numeric_level = getattr(logging, args.loglevel.upper(), None)
     if not isinstance(numeric_level, int):
         raise ValueError(f"Invalid log level: {args.loglevel}")
-    logging.basicConfig(level=numeric_level, format="%(asctime)s [%(levelname)s] %(message)s")
+    # Log to the terminal and to data/trmnl.log (untracked, so it survives restarts and updates).
+    # 5 files of 2 MB are kept.
+    log_handlers = [logging.StreamHandler()]
+    try:
+        log_handlers.append(RotatingFileHandler(args.logfile, maxBytes=2_000_000, backupCount=4))
+    except OSError as e:
+        print(f"Not logging to {args.logfile}: {e}")
+    logging.basicConfig(level=numeric_level, format="%(asctime)s [%(levelname)s] %(message)s", handlers=log_handlers)
     logger.setLevel(numeric_level)
 
     # Load devices from disk at startup
@@ -346,5 +355,6 @@ if __name__ == "__main__":
 
     logger.info(f"Starting server on {args.host}:{args.port} with loglevel={args.loglevel}")
     address = args.address
-    uvicorn.run(app, host=args.host, port=args.port, log_level=args.loglevel)
+    # log_config=None: uvicorn's own messages and access log go through the handlers above too
+    uvicorn.run(app, host=args.host, port=args.port, log_level=args.loglevel, log_config=None)
 
